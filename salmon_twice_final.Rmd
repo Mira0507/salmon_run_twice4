@@ -1,0 +1,307 @@
+---
+output: html_document
+title: "Do two Salmon (ver. 1.4.0) runs in a row give the same TPM?"
+author: "Mira Sohn"
+date: "2020/11/29"
+---
+
+```{r global_options, include=FALSE}
+
+knitr::opts_chunk$set(
+    warning=FALSE,
+    message=FALSE
+    )
+
+```
+
+## Loading packages
+
+```{r loading_packages}
+
+library(data.table)
+library(rmarkdown)
+library(AnnotationHub)
+library(tidyverse)
+library(tximport)
+library(ggplot2)
+library(DESeq2)
+library(gridExtra)
+```
+
+## Setting AnnotationHub
+## Assign your species of interest
+
+```{r annotationhub_setup}
+
+AnnotationSpecies <- "Homo sapiens"  # Assign your species 
+ah <- AnnotationHub(hub=getAnnotationHubOption("URL"))   # Bring annotation DB
+
+```
+
+## Running AnnotationHub 
+
+```{r run_annotationhub}
+
+ahQuery <- query(ah, c("OrgDb", AnnotationSpecies))      # Filter annotation of interest
+
+if (length(ahQuery) == 1) {
+    DBName <- names(ahQuery)
+} else if (length(ahQuery) > 1) {
+               DBName <- names(ahQuery)[1]
+} else {
+    print("You don't have a valid DB")
+    rmarkdown::render() 
+} 
+
+AnnoDb <- ah[[DBName]] # Store into an OrgDb object  
+
+
+# Explore your OrgDb object with following accessors:
+# columns(AnnpDb)
+# keytypes(AnnoDb)
+# keys(AnnoDb, keytype=..)
+# select(AnnoDb, keys=.., columns=.., keytype=...)
+AnnoKey <- keys(AnnoDb, keytype="ENSEMBLTRANS")
+
+# Note: Annotation has to be done with not genome but transcripts 
+AnnoDb <- select(AnnoDb, 
+                 AnnoKey,
+                 keytype="ENSEMBLTRANS",
+                 columns="SYMBOL")
+
+```
+
+
+## Checking out the AnnotationHub output 
+
+```{r checking_annotationhub_output}
+
+# Check if your AnnoDb has been extracted and saved correctely
+class(AnnoDb)
+head(AnnoDb)
+
+```
+
+## Defining file name and path for .sf files
+### .sf files have been created from fastq data by salmon
+
+
+
+```{r preparing_importing.sf}
+
+# This code chunk needs to be written by yourself 
+
+# Define run options 
+Projects <- c("gc-seq","gc", "seq", "default")
+
+# Directory names containing .sf files
+Runs <- c() 
+for (x in Projects) {
+    Runs <- c(Runs, paste0(x, "-quant", 1:2))
+}
+
+print(Runs)
+
+
+# Define sample names 
+SampleNames <-  c("Mock_72hpi_S1",
+                 "Mock_72hpi_S2",
+                 "Mock_72hpi_S3",
+                 "SARS-CoV-2_72hpi_S7",
+                 "SARS-CoV-2_72hpi_S8",
+                 "SARS-CoV-2_72hpi_S9") 
+
+# Define .sf path 
+path <- c() 
+
+for (x in Runs) {
+
+    for (y in SampleNames) {
+
+        p <- paste0(x, "/", y, ".quant", "/quant.sf")
+        path <- c(path, p)
+    }
+}
+
+run_option <- c()
+for (i in 1:4) {
+
+    run_option <- c(run_option, rep(Projects[i], 12)) 
+}
+
+# Generate a data frame summarizing sample and path info
+totalData <- data.frame(SampleName=rep(SampleNames, 8),
+                        Group=rep(c(rep("Mock", 3), rep("CoV", 3)), 8),
+                        runOption=factor(run_option, levels=Projects), 
+                        runBatch=rep(c(rep(1, 6), rep(2, 6)), 4),
+                        Path=path)
+
+# Split the data frame by run option
+dataList <- split(totalData, totalData$runOption)
+
+# Explore the data list
+for (x in Projects) { 
+
+    print(dataList[[x]])
+}
+```
+
+## Extracting TPM data from .sf files 
+
+
+```{r saving_tpm_to_dataframe}
+
+# Set a function converting .sf to txi
+sf2txi.fn <- function(path) {
+
+    tximport(path, 
+             type="salmon", 
+             tx2gene=AnnoDb, 
+             countsFromAbundance="lengthScaledTPM", 
+             ignoreTxVersion=T)
+}
+
+# Set a function converting txi to log(TPM + 1) count 
+txi2counts.fn <- function(txi, meta) {
+
+    dds <- DESeqDataSetFromTximport(txi, colData=meta, design=~Group)
+
+    count <- log(counts(dds) + 1)
+
+    count <- as.data.frame(count) %>% 
+        rownames_to_column(var="Gene")
+
+    return(count)
+}
+
+
+# Set a function extracting TPM and storing it to a data frame
+sf2tpm.fn <- function(DataFrame) {
+
+    # b1 = 1st run
+    # b2 = 2nd run
+    # Separate the data frame by run 
+    b1 <- DataFrame[1:6,] 
+    b2 <- DataFrame[7:12,]
+
+    # Name rows
+    rownames(b1) <- SampleNames
+    rownames(b2) <- SampleNames
+
+    # Extract TPM from a vector of .sf files and store into a txi object
+    txi1 <- sf2txi.fn(b1$Path) 
+    txi2 <- sf2txi.fn(b2$Path) 
+
+    # convert txi objects to log(TPM + 1) count tables 
+    tpm1 <- txi2counts.fn(txi1, b1)
+    tpm2 <- txi2counts.fn(txi2, b2)
+
+    # Join the tpm tables from run 1 & 2
+    tpmCompare <- full_join(tpm1, tpm2, 
+                              by="Gene", 
+                              suffix=c(".b1", ".b2"))
+
+    return(tpmCompare)
+
+
+
+}
+
+
+# Initialize a list to store joined tpm tables by run option (e.g. "gc", "seq", etc)
+tpmList <- dataList
+
+for (x in Projects) {
+
+
+    tpmList[[x]] <- sf2tpm.fn(dataList[[x]])
+
+}
+
+summary(tpmList)
+head(tpmList[[1]])
+dim(tpmList[[1]])
+
+
+```
+
+## Data trimming (NA and zero-TPM transcripts)
+
+
+```{r trimming_tpmtables}
+
+# Before trimming
+dim(tpmList[[1]])
+
+# Set simplified column (sample) names 
+NewCol <- paste0(dataList[[1]]$Group, 1:3)
+NewCol <- c(paste0(NewCol[1:6], ".b1"), paste0(NewCol[7:12], ".b2"))
+
+# Trim tpm tables in the tpmList 
+for (x in Projects) {
+
+    dt <- tpmList[[x]]
+
+    # Slice the table only having tpm 
+    dt.tpm <- dt[, -1]
+
+    # Filter out zero-tpm genes
+    dt.tpm <- dt.tpm[rowSums(dt.tpm) > 0,]
+
+    # Filter out NA genes 
+    dt.tpm <- dt.tpm[complete.cases(dt.tpm),]
+
+    # Name columns simpler
+    colnames(dt.tpm) <- NewCol
+
+    # Replace tpm tables 
+    tpmList[[x]] <- dt.tpm
+    
+
+}
+
+# After trimming 
+dim(tpmList[[1]])
+head(tpmList[[1]])
+
+```
+
+
+## Plotting TPM 
+
+
+```{r plotting_tpm, fig.width=8, fig.height=8}
+
+alpha=0.5
+
+runPlot.fn <- function(List, runOption) { 
+ggplot(List[[runOption]]) +
+geom_point(aes(x=Mock1.b1, y=Mock1.b2), alpha=alpha) + 
+geom_point(aes(x=Mock2.b1, y=Mock2.b2), alpha=alpha) + 
+geom_point(aes(x=Mock3.b1, y=Mock3.b2), alpha=alpha) + 
+geom_point(aes(x=CoV1.b1, y=CoV1.b2), alpha=alpha) +
+geom_point(aes(x=CoV2.b1, y=CoV2.b2), alpha=alpha) + 
+geom_point(aes(x=CoV3.b1, y=CoV3.b2), alpha=alpha) +
+theme_bw() + 
+ggtitle(paste("Salmon two runs in a row:", runOption)) + 
+xlab("1st Run") + 
+ylab("2nd Run") + 
+geom_abline(slope=1, color="red", linetype="dashed", size=1)
+}
+
+grid.arrange(runPlot.fn(tpmList, 'gc-seq'),
+             runPlot.fn(tpmList, 'gc'), 
+             runPlot.fn(tpmList, 'seq'),
+             runPlot.fn(tpmList, 'default'), 
+             nrow=2)
+
+```
+
+
+
+
+## Session Info 
+
+```{r sessionInfo}
+sessionInfo()
+```
